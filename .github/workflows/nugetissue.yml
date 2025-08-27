@@ -1,31 +1,59 @@
 name: CI/CD Pipeline
 
 on:
- workflow_dispatch:
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: 'Force publish to NuGet (bypasses branch check)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  CONFIGURATION: 'Release'
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for better versioning
     
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '8.0.x'
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+        
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
         
     - name: Restore dependencies
       run: dotnet restore
       
     - name: Build
-      run: dotnet build --no-restore --configuration Release
+      run: dotnet build --no-restore --configuration ${{ env.CONFIGURATION }}
       
     - name: Test
-      run: dotnet test --no-build --configuration Release --verbosity normal
+      run: dotnet test --no-build --configuration ${{ env.CONFIGURATION }} --verbosity normal --collect:"XPlat Code Coverage" --results-directory ./coverage
       
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: ./coverage
+        
     - name: Create NuGet package
-      run: dotnet pack --no-build --configuration Release --output ./artifacts
+      run: dotnet pack --no-build --configuration ${{ env.CONFIGURATION }} --output ./artifacts
       
     - name: Upload package artifacts
       uses: actions/upload-artifact@v4
@@ -36,21 +64,49 @@ jobs:
   publish-nuget:
     needs: build-and-test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') ||
+      (github.event_name == 'workflow_dispatch' && inputs.force_publish == true)
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
     
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '8.0.x'
+        dotnet-version: ${{ env.DOTNET_VERSION }}
         
-    - name: Build and Pack
-      run: |
-        dotnet restore
-        dotnet pack --configuration Release --output ./artifacts
+    - name: Download package artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: nuget-packages
+        path: ./artifacts
+        
+    - name: List packages
+      run: ls -la ./artifacts/
         
     - name: Publish to NuGet
-      run: dotnet nuget push ./artifacts/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
-      if: ${{ secrets.NUGET_API_KEY != '' }}
+      if: secrets.NUGET_API_KEY != ''
+      run: |
+        for package in ./artifacts/*.nupkg; do
+          echo "Publishing $package"
+          dotnet nuget push "$package" \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate \
+            --no-symbols
+        done
+        
+    - name: Create GitHub Release
+      if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Release v${{ github.run_number }}
+        draft: false
+        prerelease: false
+        files: ./artifacts/*.nupkg
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
